@@ -16,22 +16,28 @@ OS_NAME = platform.system()
 gui = None
 
 
+#Extracted helper to clarify Windows launcher check
+def is_launched_from_py_launcher() -> bool:
+    """Return True if the process was started directly via Windows py.exe."""
+    import psutil
+
+    parent_process_name = psutil.Process(os.getppid()).name()
+    return parent_process_name == "py.exe"
+
+
 # On Windows, the bot can be started by clicking this Python file. In that case, the terminal
 # window is only open for as long as the bot runs, which would make it impossible to see error
 # messages during a crash.
 # For those cases, we register an `atexit` handler that will wait for user input before closing
 # the terminal window.
 def on_exit() -> None:
-    if OS_NAME == "Windows":
-        import psutil
-        import os
+    if OS_NAME != "Windows" or not is_launched_from_py_launcher():
+        return
 
-        parent_process_name = psutil.Process(os.getppid()).name()
-        if parent_process_name == "py.exe":
-            if gui is not None and gui.window is not None:
-                gui.window.withdraw()
+    if gui is not None and gui.window is not None:
+        gui.window.withdraw()
 
-            input("\nPress Enter to close...")
+    input("\nPress Enter to close...")
 
 
 atexit.register(on_exit)
@@ -51,6 +57,28 @@ class StartupSettings:
     always_on_top: bool
     config_path: str
 
+    #Method to create initialize startup settings from arguments
+    @classmethod
+    def from_args(cls, args: argparse.Namespace, preselected_profile: "Profile | None") -> "StartupSettings":
+        return cls(
+            profile=preselected_profile,
+            debug=bool(args.debug),
+            bot_mode=args.bot_mode or "Manual",
+            headless=bool(args.headless),
+            no_video=bool(args.no_video),
+            no_audio=bool(args.no_audio),
+            no_theme=bool(args.no_theme),
+            use_opengl=bool(args.use_opengl),
+            emulation_speed=int(args.emulation_speed or "1"),
+            always_on_top=bool(args.always_on_top),
+            config_path=args.config_path,
+        )
+
+
+#Checks if it is a valid directory
+def is_valid_directory(path_obj: pathlib.Path) -> bool:
+    return path_obj.exists() and path_obj.is_dir()
+
 
 def directory_arg(value: str) -> pathlib.Path:
     """Determine if the value is a valid readable directory.
@@ -58,7 +86,7 @@ def directory_arg(value: str) -> pathlib.Path:
     :param value: Directory to verify.
     """
     path_obj = pathlib.Path(value)
-    if not path_obj.is_dir() or not path_obj.exists():
+    if not is_valid_directory(path_obj):
         from modules import exceptions
 
         raise exceptions.CriticalDirectoryMissing(value)
@@ -98,28 +126,43 @@ def parse_arguments(bot_mode_names: list[str]) -> StartupSettings:
     if args.profile and profile_directory_exists(args.profile):
         preselected_profile = load_profile_by_name(args.profile)
 
-    return StartupSettings(
-        profile=preselected_profile,
-        debug=bool(args.debug),
-        bot_mode=args.bot_mode or "Manual",
-        headless=bool(args.headless),
-        no_video=bool(args.no_video),
-        no_audio=bool(args.no_audio),
-        no_theme=bool(args.no_theme),
-        use_opengl=bool(args.use_opengl),
-        emulation_speed=int(args.emulation_speed or "1"),
-        always_on_top=bool(args.always_on_top),
-        config_path=args.config_path,
-    )
+    return StartupSettings.from_args(args, preselected_profile)
+
+
+#Rename / Replace Magic Number
+def register_signal_handlers(context) -> None:
+    """Register OS-specific shutdown handlers to safely save emulator state."""
+    if OS_NAME == "Windows":
+        import win32api
+        import win32con
+
+        def win32_signal_handler(control_event: int) -> None:
+            if control_event == win32con.CTRL_CLOSE_EVENT and context.emulator is not None:
+                context.emulator.shutdown()
+
+        win32api.SetConsoleCtrlHandler(win32_signal_handler, True)
+    #Create a termination handler if something goes wrong"
+    def sigterm_handler(signal_number, stack_frame) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if context.emulator is not None:
+            context.emulator.shutdown()
+            context.emulator = None
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
 
 
 if __name__ == "__main__":
+
     can_update_and_install_dependencies = not (get_base_path() / ".is_frozen").exists()
 
     if can_update_and_install_dependencies:
         from requirements import check_requirements
 
         check_requirements()
+
     from modules.debug import debug
     from modules.context import context
     from modules.console import console
@@ -133,41 +176,14 @@ if __name__ == "__main__":
 
     register_exception_hook()
     load_plugins()
-
-    # This catches the signal Windows emits when the underlying console window is closed
-    # by the user. We still want to save the emulator state in that case, which would not
-    # happen by default!
-    if OS_NAME == "Windows":
-        import win32api
-
-        def win32_signal_handler(signal_type):
-            if signal_type == 2 and context.emulator is not None:
-                context.emulator.shutdown()
-
-        win32api.SetConsoleCtrlHandler(win32_signal_handler, True)
-
-    # SIGTERM is what service managers (systemd, Docker, ...) send to stop the bot. By default,
-    # Python would just die without saving the emulator state, so we shut down the same way as
-    # when the window is closed. Python runs signal handlers in the main thread in between two
-    # bytecode instructions, so this never happens in the middle of emulating a frame.
-    # `sys.exit()` is not an option here because it would wait for the (non-daemon) HTTP server
-    # thread to end before running the atexit handlers, i.e. forever.
-    def sigterm_handler(signal_number, stack_frame):
-        # Ignore repeated SIGTERMs so they can't interrupt writing the save state.
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        if context.emulator is not None:
-            context.emulator.shutdown()
-            context.emulator = None
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(0)
-
-    signal.signal(signal.SIGTERM, sigterm_handler)
+    register_signal_handlers(context)
 
     startup_settings = parse_arguments(get_bot_mode_names())
     console.print(f"Starting [bold cyan]{pokebot_name} {pokebot_version}![/]")
 
-    if can_update_and_install_dependencies and not (get_base_path() / ".git").is_dir():
+    #Better wording to explain when auto-updater should run
+    is_not_git_install = can_update_and_install_dependencies and not (get_base_path() / ".git").is_dir()
+    if is_not_git_install:
         from updater import run_updater
 
         run_updater()
@@ -179,9 +195,6 @@ if __name__ == "__main__":
     else:
         from modules.gui import PokebotGui
 
-        # Previously, theming could _only_ be disabled through an environment flag. Now, it can
-        # be disabled using a command-line argument but for backward-compatibility reasons we
-        # accept either.
         no_theme = os.getenv("POKEBOT_UNTHEMED") == "1" or startup_settings.no_theme
         gui = PokebotGui(
             on_exit,
@@ -194,6 +207,9 @@ if __name__ == "__main__":
     if profile is None:
         raise RuntimeError("No profile was selected.")
 
+    #Clarifying variable assignment
+    is_debug_enabled = startup_settings.debug and not startup_settings.headless
+
     context.profile = profile
     context.config.load(profile.path, strict=False)
     set_rom(profile.rom)
@@ -201,7 +217,7 @@ if __name__ == "__main__":
     context.audio = not startup_settings.no_audio
     context.video = not startup_settings.no_video
     context.emulation_speed = startup_settings.emulation_speed
-    context.debug = startup_settings.debug and not startup_settings.headless
+    context.debug = is_debug_enabled
     context.bot_mode = startup_settings.bot_mode
     context.gui = gui
 
